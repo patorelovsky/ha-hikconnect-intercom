@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL
 from homeassistant.core import HomeAssistant
@@ -25,6 +25,7 @@ class HikConnectCamera(Camera):
 
     _attr_has_entity_name = True
     _attr_name = None
+    _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, relay: HikConnectRelay, entry: ConfigEntry) -> None:
         super().__init__()

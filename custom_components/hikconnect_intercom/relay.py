@@ -135,18 +135,48 @@ class _FfmpegRtspServerSink:
     as its own tiny RTSP server (``-rtsp_flags listen``), so no separate
     RTSP server binary (e.g. MediaMTX) is required. ffmpeg already ships
     with Home Assistant.
+
+    Note: ffmpeg's RTSP "listen" server only serves a single client
+    session; once that client disconnects it exits, so it must be
+    respawned for every new viewer/reconnect. A minimum restart interval
+    guards against a tight crash loop if ffmpeg fails immediately
+    (e.g. bad arguments, port in use).
     """
+
+    _MIN_RESTART_INTERVAL = 2.0
 
     def __init__(self, rtsp_url: str, ffmpeg_path: str = "ffmpeg") -> None:
         self._rtsp_url = rtsp_url
         self._ffmpeg_path = ffmpeg_path
         self._proc: subprocess.Popen | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._last_stderr: list[str] = []
+        self._last_start = 0.0
+
+    def _pump_stderr(self, proc: subprocess.Popen) -> None:
+        assert proc.stderr is not None
+        for raw_line in proc.stderr:
+            line = raw_line.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            self._last_stderr.append(line)
+            del self._last_stderr[:-20]
+            _LOGGER.debug("ffmpeg[%s]: %s", proc.pid, line)
 
     def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
         if self._proc is not None:
-            _LOGGER.warning("ffmpeg exited (code %s); restarting", self._proc.returncode)
+            tail = " | ".join(self._last_stderr[-8:])
+            _LOGGER.warning(
+                "ffmpeg exited (code %s); restarting. Last output: %s",
+                self._proc.returncode, tail or "(no stderr captured)",
+            )
+        wait_left = self._MIN_RESTART_INTERVAL - (time.monotonic() - self._last_start)
+        if wait_left > 0:
+            time.sleep(wait_left)
+        self._last_start = time.monotonic()
+        self._last_stderr = []
         self._proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no user-controlled binary path
             [
                 self._ffmpeg_path, "-y", "-loglevel", "warning",
@@ -155,7 +185,12 @@ class _FfmpegRtspServerSink:
                 self._rtsp_url,
             ],
             stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        self._stderr_thread = threading.Thread(
+            target=self._pump_stderr, args=(self._proc,), daemon=True
+        )
+        self._stderr_thread.start()
         _LOGGER.info("ffmpeg RTSP server started (pid %s) at %s", self._proc.pid, self._rtsp_url)
 
     def write(self, data: bytes) -> None:
