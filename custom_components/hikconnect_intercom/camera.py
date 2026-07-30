@@ -25,6 +25,7 @@ class HikConnectCamera(Camera):
 
     _attr_has_entity_name = True
     _attr_name = None
+    _attr_icon = "mdi:doorbell-video"
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, relay: HikConnectRelay, entry: ConfigEntry) -> None:

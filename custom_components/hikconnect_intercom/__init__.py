@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
@@ -27,6 +28,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     while port in used_ports:
         port += 1
 
+    storage_dir = Path(hass.config.path(f".storage/{DOMAIN}"))
+
     relay = HikConnectRelay(
         email=entry.data[CONF_EMAIL],
         password=entry.data[CONF_PASSWORD],
@@ -34,6 +37,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         channel=entry.data[CONF_CHANNEL],
         media_key=entry.data[CONF_MEDIA_KEY],
         rtsp_port=port,
+        storage_dir=storage_dir,
     )
     await hass.async_add_executor_job(relay.start)
 

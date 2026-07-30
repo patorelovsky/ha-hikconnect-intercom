@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -26,6 +28,7 @@ from pyezvizapi.cloud_stream import open_cloud_stream
 from pyezvizapi.stream import decrypt_hikvision_ps_video
 
 from .const import AUTH_BASE, FEATURE_CODE, LOGIN_URL
+from .mediamtx import ensure_mediamtx
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -141,12 +144,23 @@ class _FfmpegRtspServerSink:
     respawned for every new viewer/reconnect. A minimum restart interval
     guards against a tight crash loop if ffmpeg fails immediately
     (e.g. bad arguments, port in use).
+
+    IMPORTANT: ffmpeg's own "-rtsp_flags listen" option only applies to the
+    RTSP *demuxer* (reading an rtsp:// URL as input) in current ffmpeg
+    builds - it is not a valid way to make the RTSP *muxer* (writing to an
+    rtsp:// URL as output) act as a server. Using it as an output option
+    silently does nothing useful: ffmpeg instead tries to connect *out* as
+    an RTSP client, which fails with "Connection refused" if nothing is
+    listening. So this sink does NOT try to have ffmpeg serve RTSP itself;
+    instead it PUSHES (publishes) the stream as a client into a real,
+    dedicated RTSP server (MediaMTX, see mediamtx.py/_MediaMtxServer
+    below), exactly like the Hik-Connect app's own local relay would.
     """
 
     _MIN_RESTART_INTERVAL = 2.0
 
-    def __init__(self, rtsp_url: str, ffmpeg_path: str = "ffmpeg") -> None:
-        self._rtsp_url = rtsp_url
+    def __init__(self, publish_url: str, ffmpeg_path: str = "ffmpeg") -> None:
+        self._publish_url = publish_url
         self._ffmpeg_path = ffmpeg_path
         self._proc: subprocess.Popen | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -181,8 +195,8 @@ class _FfmpegRtspServerSink:
             [
                 self._ffmpeg_path, "-y", "-loglevel", "warning",
                 "-f", "h264", "-i", "-",
-                "-c", "copy", "-f", "rtsp", "-rtsp_flags", "listen",
-                self._rtsp_url,
+                "-c", "copy", "-f", "rtsp", "-rtsp_transport", "tcp",
+                self._publish_url,
             ],
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -191,7 +205,7 @@ class _FfmpegRtspServerSink:
             target=self._pump_stderr, args=(self._proc,), daemon=True
         )
         self._stderr_thread.start()
-        _LOGGER.info("ffmpeg RTSP server started (pid %s) at %s", self._proc.pid, self._rtsp_url)
+        _LOGGER.info("ffmpeg publisher started (pid %s) -> %s", self._proc.pid, self._publish_url)
 
     def write(self, data: bytes) -> None:
         self._ensure_started()
@@ -219,9 +233,77 @@ class _FfmpegRtspServerSink:
             self._proc = None
 
 
+class _MediaMtxServer:
+    """Manages a single MediaMTX subprocess acting as a minimal, local-only
+    RTSP server. ffmpeg publishes into it (as a client) and Home
+    Assistant's camera/stream integration plays back from it (also as a
+    client) - MediaMTX handles the actual TCP listening/serving, which
+    ffmpeg itself cannot reliably do for RTSP output (see
+    _FfmpegRtspServerSink's docstring).
+    """
+
+    def __init__(self, mediamtx_path: Path, rtsp_port: int) -> None:
+        self._mediamtx_path = mediamtx_path
+        self._rtsp_port = rtsp_port
+        self._proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        env = {
+            # Only enable the bare minimum (plain RTSP over TCP); disable
+            # every other protocol/API MediaMTX supports by default.
+            "MTX_RTSPADDRESS": f":{self._rtsp_port}",
+            "MTX_PROTOCOLS": "tcp",
+            "MTX_RTMP": "no",
+            "MTX_HLS": "no",
+            "MTX_WEBRTC": "no",
+            "MTX_SRT": "no",
+            "MTX_API": "no",
+            "MTX_METRICS": "no",
+            "MTX_PLAYBACK": "no",
+            "MTX_LOGLEVEL": "warn",
+        }
+        self._proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell, trusted local binary
+            [str(self._mediamtx_path)],
+            env={**_os_environ(), **env},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _LOGGER.info(
+            "MediaMTX started (pid %s), RTSP on port %s", self._proc.pid, self._rtsp_port
+        )
+        # Give it a moment to actually bind before ffmpeg/clients try to connect.
+        time.sleep(1.0)
+
+    def ensure_running(self) -> None:
+        if self._proc is None or self._proc.poll() is not None:
+            if self._proc is not None:
+                _LOGGER.warning("MediaMTX exited (code %s); restarting", self._proc.returncode)
+            self.start()
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            self._proc = None
+
+
+def _os_environ() -> dict[str, str]:
+    return dict(os.environ)
+
+
 class HikConnectRelay:
     """Manages the full cloud-pull-decrypt-republish pipeline for one
     intercom channel, running in a dedicated background thread.
+
+    Video flows: Hik-Connect cloud VTM -> depacketize/decrypt (this
+    process) -> ffmpeg (publishes as an RTSP client) -> MediaMTX (the
+    actual RTSP server) -> Home Assistant's camera/stream (plays back as
+    an RTSP client).
     """
 
     def __init__(
@@ -232,6 +314,7 @@ class HikConnectRelay:
         channel: int,
         media_key: str,
         rtsp_port: int,
+        storage_dir: Path,
     ) -> None:
         self._email = email
         self._password = password
@@ -239,7 +322,10 @@ class HikConnectRelay:
         self._channel = channel
         self._media_key = media_key
         self.rtsp_port = rtsp_port
-        self.rtsp_url = f"rtsp://127.0.0.1:{rtsp_port}/{serial}_{channel}"
+        path = f"{serial}_{channel}"
+        self.rtsp_url = f"rtsp://127.0.0.1:{rtsp_port}/{path}"
+        self._storage_dir = storage_dir
+        self._mediamtx: _MediaMtxServer | None = None
         self._sink = _FfmpegRtspServerSink(self.rtsp_url)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -247,6 +333,9 @@ class HikConnectRelay:
     def start(self) -> None:
         if self._thread is not None:
             return
+        mediamtx_path = ensure_mediamtx(self._storage_dir / "mediamtx")
+        self._mediamtx = _MediaMtxServer(mediamtx_path, self.rtsp_port)
+        self._mediamtx.start()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run, name=f"hikconnect_relay_{self._serial}_{self._channel}", daemon=True
@@ -256,6 +345,9 @@ class HikConnectRelay:
     def stop(self) -> None:
         self._stop_event.set()
         self._sink.stop()
+        if self._mediamtx is not None:
+            self._mediamtx.stop()
+            self._mediamtx = None
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
@@ -272,6 +364,8 @@ class HikConnectRelay:
         consecutive_failures = 0
         while not self._stop_event.is_set():
             try:
+                assert self._mediamtx is not None
+                self._mediamtx.ensure_running()
                 depk = _H264Depacketizer()
                 with open_cloud_stream(client, self._serial, channel=self._channel, timeout=30) as stream:
                     stream.start()
