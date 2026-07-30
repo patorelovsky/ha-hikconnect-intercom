@@ -134,16 +134,7 @@ class _H264Depacketizer:
 
 
 class _FfmpegRtspServerSink:
-    """Feeds a raw Annex-B H.264 stream into an ffmpeg subprocess that acts
-    as its own tiny RTSP server (``-rtsp_flags listen``), so no separate
-    RTSP server binary (e.g. MediaMTX) is required. ffmpeg already ships
-    with Home Assistant.
-
-    Note: ffmpeg's RTSP "listen" server only serves a single client
-    session; once that client disconnects it exits, so it must be
-    respawned for every new viewer/reconnect. A minimum restart interval
-    guards against a tight crash loop if ffmpeg fails immediately
-    (e.g. bad arguments, port in use).
+    """Publishes a raw Annex-B H.264 stream to a local MediaMTX server.
 
     IMPORTANT: ffmpeg's own "-rtsp_flags listen" option only applies to the
     RTSP *demuxer* (reading an rtsp:// URL as input) in current ffmpeg
@@ -166,6 +157,9 @@ class _FfmpegRtspServerSink:
         self._stderr_thread: threading.Thread | None = None
         self._last_stderr: list[str] = []
         self._last_start = 0.0
+        self._awaiting_keyframe = True
+        self._sps: bytes | None = None
+        self._pps: bytes | None = None
 
     def _pump_stderr(self, proc: subprocess.Popen) -> None:
         assert proc.stderr is not None
@@ -180,12 +174,6 @@ class _FfmpegRtspServerSink:
     def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
-        if self._proc is not None:
-            tail = " | ".join(self._last_stderr[-8:])
-            _LOGGER.warning(
-                "ffmpeg exited (code %s); restarting. Last output: %s",
-                self._proc.returncode, tail or "(no stderr captured)",
-            )
         wait_left = self._MIN_RESTART_INTERVAL - (time.monotonic() - self._last_start)
         if wait_left > 0:
             time.sleep(wait_left)
@@ -207,14 +195,68 @@ class _FfmpegRtspServerSink:
         self._stderr_thread.start()
         _LOGGER.info("ffmpeg publisher started (pid %s) -> %s", self._proc.pid, self._publish_url)
 
-    def write(self, data: bytes) -> None:
-        self._ensure_started()
+    def _reset_for_keyframe(self) -> None:
+        """Discard partial H.264 state until a decodable keyframe arrives."""
+        self._awaiting_keyframe = True
+        self._sps = None
+        self._pps = None
+
+    def _handle_exited_process(self) -> None:
+        assert self._proc is not None
+        tail = " | ".join(self._last_stderr[-8:])
+        _LOGGER.warning(
+            "ffmpeg exited (code %s); waiting for a new H.264 keyframe. Last output: %s",
+            self._proc.returncode,
+            tail or "(no stderr captured)",
+        )
+        self._proc = None
+        self._reset_for_keyframe()
+
+    @staticmethod
+    def _nal_type(data: bytes) -> int | None:
+        """Return the H.264 NAL unit type from one Annex-B NAL."""
+        if data.startswith(b"\x00\x00\x00\x01") and len(data) > 4:
+            return data[4] & 0x1F
+        if data.startswith(b"\x00\x00\x01") and len(data) > 3:
+            return data[3] & 0x1F
+        return None
+
+    def _write_to_process(self, data: bytes) -> bool:
         assert self._proc is not None and self._proc.stdin is not None
         try:
             self._proc.stdin.write(data)
         except (BrokenPipeError, OSError):
-            _LOGGER.warning("ffmpeg pipe broke; will restart on next write")
+            _LOGGER.warning("ffmpeg pipe broke; waiting for a new H.264 keyframe")
             self._proc = None
+            self._reset_for_keyframe()
+            return False
+        return True
+
+    def write(self, data: bytes) -> None:
+        if self._proc is not None and self._proc.poll() is not None:
+            self._handle_exited_process()
+
+        if self._awaiting_keyframe:
+            nal_type = self._nal_type(data)
+            if nal_type == 7:  # SPS
+                self._sps = data
+                self._pps = None
+            elif nal_type == 8 and self._sps is not None:  # PPS
+                self._pps = data
+            elif nal_type == 5 and self._sps is not None and self._pps is not None:  # IDR
+                # ffmpeg constructs the RTSP SDP when the output is first
+                # opened. Starting on a delta frame leaves it without codec
+                # parameters, which MediaMTX correctly rejects with HTTP 400.
+                self._ensure_started()
+                if (
+                    self._write_to_process(self._sps)
+                    and self._write_to_process(self._pps)
+                    and self._write_to_process(data)
+                ):
+                    self._awaiting_keyframe = False
+            return
+
+        self._write_to_process(data)
 
     def flush(self) -> None:
         if self._proc is not None and self._proc.stdin is not None:
@@ -222,6 +264,7 @@ class _FfmpegRtspServerSink:
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._proc = None
+                self._reset_for_keyframe()
 
     def stop(self) -> None:
         if self._proc is not None:
@@ -254,15 +297,19 @@ class _MediaMtxServer:
             # Only enable the bare minimum (plain RTSP over TCP); disable
             # every other protocol/API MediaMTX supports by default.
             "MTX_RTSPADDRESS": f":{self._rtsp_port}",
-            "MTX_PROTOCOLS": "tcp",
+            "MTX_RTSPTRANSPORTS": "tcp",
             "MTX_RTMP": "no",
             "MTX_HLS": "no",
             "MTX_WEBRTC": "no",
             "MTX_SRT": "no",
+            "MTX_MOQ": "no",
             "MTX_API": "no",
             "MTX_METRICS": "no",
             "MTX_PLAYBACK": "no",
             "MTX_LOGLEVEL": "warn",
+            # MediaMTX v1.19 does not create paths implicitly. Allow the
+            # relay's per-channel path to be published and read.
+            "MTX_PATHS_ALL_SOURCE": "publisher",
         }
         self._proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell, trusted local binary
             [str(self._mediamtx_path)],
