@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Hik-Connect Intercom (Cloud)",
+        "description": "Unofficial cloud relay for Hikvision intercoms with no local network access. Uses the same Hik-Connect cloud video relay as the mobile app.",
+        "data": {
+          "email": "Hik-Connect account email",
+          "password": "Hik-Connect account password",
+          "serial": "Device serial (e.g. GC4184449)",
+          "channel": "Channel (1 = outdoor station)",
+          "media_key": "Verification code (Hik-Connect server settings screen)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not log in to Hik-Connect with these credentials."
+    },
+    "abort": {
+      "already_configured": "This device/channel is already configured."
+    }
+  }
+}
