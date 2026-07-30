@@ -7,7 +7,7 @@
         "data": {
           "email": "Hik-Connect account email",
           "password": "Hik-Connect account password",
-          "serial": "Device serial (e.g. GC4184449)",
+          "serial": "Device serial (e.g. A1B2C34567)",
           "channel": "Channel (1 = outdoor station)",
           "media_key": "Verification code (Hik-Connect server settings screen)"
         }

@@ -49,7 +49,7 @@ at your own risk, on your own device/account only.
 5. Go to **Settings → Devices & Services → Add Integration**, search for
    **"Hik-Connect Intercom"**, and fill in the form:
    - Hik-Connect account email/password
-   - Device serial (e.g. `GC4184449`)
+   - Device serial (e.g. `A1B2C34567`)
    - Channel (`1` is typically the outdoor station)
    - Verification code — found on the device itself: touchscreen →
      Settings → Hik-Connect server settings → "Overovací kód" /
